@@ -1,0 +1,409 @@
+# The code has been copied to the clipboard.
+# Press Ctrl+V to in a code cell to paste it.
+# The code has been copied to the clipboard.
+# Press Ctrl+V to in a code cell to paste it.
+# Define the region of interest based on Mvita constituency.
+mvita = admin.filter(ee.Filter.eq('CONSTITUEN', 'MVITA'))
+geometry = mvita.geometry()
+Map.centerObject(geometry, 15)
+
+# Function to filter out cloudy pixels.
+def cloudMask(cloudyScene):
+scored = ee.Algorithms.Landsat.simpleCloudScore(cloudyScene)
+mask = scored.select(['cloud']).lte(10)
+return cloudyScene.updateMask(mask)
+
+# Generate a water mask.
+water = ee.Image('JRC/GSW1_0/GlobalSurfaceWater').select('occurrence')
+notWater = water.mask().Not()
+
+# Define the date range
+now = ee.Date(Date.now())
+
+# Landsat collection filtering based on cloud cover and date.
+filtered = landsat.filter(ee.Filter.lt('CLOUD_COVER', 20)) \ \
+.filter(ee.Filter.date('2014-01-01', '2025-01-01')) \ \
+.filter(ee.Filter.bounds(geometry)) \ \
+.map(cloudMask)
+
+median = filtered.median()
+clipped = median.clip(geometry)
+
+rgbVis = {
+    "min": 0,
+    "max": 1,
+    "bands": ['B4', 'B3', 'B2']
+}
+print('Landsat collection', filtered.getInfo().getInfo())
+
+# Select thermal band 10 (with brightness temperature).
+thermal = median.select('B10') \ \
+.clip(geometry) \ \
+.updateMask(notWater)
+
+Map.addLayer(thermal, {
+    "min": 295,
+    "max": 310,
+    "palette": ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee090', '#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695']
+},
+'Landsat_BT')
+
+# Function to apply scaling factor for BT conversion
+def applyScaleFactors(image):
+bt = image.select('B10').multiply(0.00341802).add(149.0)
+return bt.rename('BT')
+
+# Apply scaling factor to all images
+btCollection = filtered.map(applyScaleFactors)
+
+# Compute mean BT over time
+meanBT = btCollection.mean()
+
+# Calculate Normalized Difference Vegetation Index (NDVI)
+dataset = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') \ \
+.filterBounds(geometry) \ \
+.filterDate('2014-01-01', '2025-01-01')
+
+def func_foe(image):
+ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
+ndbi = image.normalizedDifference(['SR_B6','SR_B5']).rename(['NDBI'])
+ndvi.updateMask(notWater)
+ndbi.updateMask(notWater)
+return image.addBands(ndvi).addBands(ndbi)
+
+computeNdvi = func_foe
+
+withNdvi = dataset.map(computeNdvi)
+compositeNdvi = withNdvi.median().clip(geometry).select('NDVI')
+compositeNdbi = withNdvi.median().clip(geometry).select('NDBI')
+
+Map.addLayer(compositeNdvi, {
+    "min": 0,
+    "max": 0.7,
+    "palette": ['FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901', '66A000', '529400', '3E8601', '207401', '056201', '004C00', '023B01', '012E01', '011D01', '011301']
+}, 'NDVI')
+
+ndbiVis = {
+    "min":0,
+    "max":0.7,
+    "palette":['white','red']
+}
+Map.addLayer(compositeNdbi,ndbiVis,'NDBI')
+
+#Exporting the NDVI for visualization
+Export.image.toDrive(
+"image"=compositeNdvi
+"description"='NDVI'
+"folder"='NDVI'
+"fileNamePrefix"='ndvi'
+"region"=geometry
+"scale"=10
+"maxPixels"=1e9
+)
+
+#Exporting the NDBI for visualization
+Export.image.toDrive(
+"image"=compositeNdbi
+"description"='NDBI'
+"folder"='NDBI'
+"fileNamePrefix"='ndbi'
+"region"=geometry
+"scale"=10
+"maxPixels"=1e9
+)
+
+# Find the minimum and maximum of NDVI.
+minMax = compositeNdvi.reduceRegion(
+"reducer"=ee.Reducer.min().combine(
+"reducer2"=ee.Reducer.max()
+"sharedInputs"=True
+)
+"geometry"=geometry
+"scale"=30
+"maxPixels"=1e9
+)
+print('minMax', minMax.getInfo().getInfo())
+
+min = ee.Number(minMax.get('NDVI_min'))
+max = ee.Number(minMax.get('NDVI_max'))
+
+# Calculate fractional vegetation (FV).
+fv = compositeNdvi.subtract(min).divide(max.subtract(min)).rename('FV')
+
+# Add FV to the image collection
+
+withfv = compositeNdvi.addBands(fv).addBands(compositeNdbi)
+Map.addLayer(fv, {
+    "min": 0,
+    "max": 0.7,
+    "palette": ['FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718', '74A901', '66A000', '529400', '3E8601', '207401', '056201', '004C00', '023B01', '012E01', '011D01', '011301']
+}, 'FV')
+
+# Export FV image
+Export.image.toDrive(
+"image"=fv
+"description"='FV'
+"folder"='FV'
+"fileNamePrefix"='fv'
+"region"=geometry
+"scale"=10
+"maxPixels"=1e9
+)
+
+# Emissivity calculations.
+a = ee.Number(0.004)
+b = ee.Number(0.986)
+em = fv.multiply(a).add(b).rename('EMM').updateMask(notWater)
+
+Map.addLayer(em, {
+    "min": 0.98,
+    "max": 0.99,
+    "palette": ['blue', 'white', 'green']
+}, 'EMM')
+
+# Export EMM image
+Export.image.toDrive(
+"image"=em
+"description"='EMM'
+"folder"='EMM'
+"fileNamePrefix"='emm'
+"region"=geometry
+"scale"=10
+"maxPixels"=1e9
+)
+
+# Calculate LST from emissivity and brightness temperature.
+lstLandsat = thermal.expression(
+'(Tb / (1 + (0.001145 * (Tb / 1.438)) * log(Ep))) - 273.15', {
+    'Tb': thermal.select('B10'),
+    'Ep': em.select('EMM')
+}).updateMask(notWater).rename('LST')
+
+Map.addLayer(lstLandsat, {
+    "min": 25,
+    "max": 35,
+    "palette": ['blue', 'white', 'red'],
+}, 'LST_Landsat')
+
+# Export LST image
+Export.image.toDrive(
+"image"=lstLandsat
+"description"='LST'
+"folder"='LST'
+"fileNamePrefix"='lst'
+"region"=geometry
+"scale"=10
+"maxPixels"=1e9
+)
+
+# Select the ESA land cover data.
+landCover = landCover.first()
+visualization = {
+    "bands": ['Map']
+}
+
+mvitalulc = landCover.clip(geometry)
+Map.addLayer(mvitalulc, visualization, 'Mvita LULC')
+
+# Export LULC image
+Export.image.toDrive(
+"image"=mvitalulc
+"description"='LULC'
+"folder"='LULC'
+"fileNamePrefix"='lula'
+"region"=geometry
+"scale"=10
+"maxPixels"=1e9
+)
+
+# Extracting the values for urban and rural areas
+urban = mvitalulc.eq(50)
+rural = mvitalulc.eq(30).Or(mvitalulc.eq(40))
+
+# Compute Mean Temperature for Urban and Rural Areas
+urbanLST = lstLandsat.updateMask(urban).reduceRegion(
+"reducer"=ee.Reducer.mean()
+"geometry"=geometry
+"scale"=30
+"maxPixels"=1e13
+).get('LST')
+
+ruralLST = lstLandsat.updateMask(rural).reduceRegion(
+"reducer"=ee.Reducer.mean()
+"geometry"=geometry
+"scale"=30
+"maxPixels"=1e13
+).get('LST')
+
+suhi = lstLandsat.subtract(ee.Number(ruralLST)).rename('SUHI')
+
+Map.addLayer(suhi, {
+    "palette": ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee090', '#ffffbf', '#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695'],
+    "min": 2,
+    "max": 8
+}, 'SUHI')
+
+# Export SUHI image
+Export.image.toDrive(
+"image"=suhi
+"description"='SUHI'
+"folder"='SUHI'
+"fileNamePrefix"='suhi'
+"region"=geometry
+"scale"=10
+"maxPixels"=1e9
+)
+
+# Convert SUHI to Integer Classes for Vectorization
+suhiClassified = suhi.expression(
+"(b(0) < 2) ? 1" + \
+": (b(0) < 5) ? 2" + \
+": 3",
+{
+    "b(0)": suhi
+}).rename("SUHI_Class").toByte()
+
+# Remove the zero values
+suhiMasked = suhiClassified.selfMask()
+
+# Add an extra column to avoid the error
+suhiForVector = suhiMasked.addBands(ee.Image.constant(1).rename("countBand"))
+
+# Convert SUHI Raster to Vector
+suhiVector = suhiForVector.reduceToVectors(
+"geometry"=geometry
+"scale"=30
+"geometryType"="polygon"
+"reducer"=ee.Reducer.count()
+"maxPixels"=1e13
+)
+print("SUHI "vector":", suhiVector.getInfo().getInfo())
+
+# Export SUHI Vector to Google Drive
+geemap.ee_export_vector_to_drive(
+"collection"=suhiVector
+"description"="SUHI_Vector"
+"fileFormat"="SHP"
+)
+
+withAllBands = withfv.addBands(urban).addBands(lstLandsat).addBands(suhi).addBands(em)
+print(withAllBands.getInfo().getInfo())
+
+#Generating training features
+landCoverClasses = {
+    "10": 'Tree Cover',
+    "20": 'Shrubland',
+    "30": 'Grassland',
+    "40": 'Cropland',
+    "50": 'Built-up',
+    "60": 'Bare/Sparse Vegetation',
+    "70": 'Snow/Ice',
+    "80": 'Water',
+    "90": 'Wetlands',
+    "95": 'Mangroves'
+}
+
+# Generate random sample points for each land cover type
+trainingFeatures = ee.FeatureCollection([])
+
+def func_pcm(classValue):
+classInt = int(classValue)
+
+# Create a mask for the current land cover class
+classMask = mvitalulc.eq(classInt)
+
+# Use stratified sampling directly from the land cover image
+samples = mvitalulc.updateMask(classMask).stratifiedSample(
+"numPoints"=100
+"classBand"='Map'
+"region"=geometry
+"scale"=30
+"seed"=42
+"geometries"=True
+
+def func_eyo(feature) = \
+return feature.set('class', classInt)
+
+).map(func_eyo)
+
+# Merge into training features
+trainingFeatures = trainingFeatures.merge(samples)
+
+Object.keys(landCoverClasses).forEach(func_pcm
+
+"properties": ['class'],
+"scale": 30,
+"geometries": True
+)
+
+def func_dol(feature):
+return feature.setGeometry(feature.geometry().centroid())
+
+trainingSamples = trainingFeatures.map(func_dol)
+
+#Extracting longitudes and lattitudes
+
+def func_vdu(feature):
+geom = feature.geometry()
+
+return feature.set(**{
+    'longitude': geom.coordinates().get(0),
+    'latitude': geom.coordinates().get(1)
+})
+
+sampleWithCoords = trainingSamples.map(func_vdu)
+
+def func_dta(feature):
+coords = feature.geometry().coordinates()
+return feature.set(**{
+    'longitude': coords.get(0),
+    'latitude': coords.get(1)
+})
+
+sampleWithCoords = sample.map(func_dta)
+
+#Exporting the training dataset
+geemap.ee_export_vector_to_drive(
+"collection"=sampleWithCoords
+"description"='UHI_training_dataset_with_coords'
+"folder"='GEE'
+"fileNamePrefix"='UHI_training_samples_with_coords'
+"fileFormat"='CSV'
+)
+
+#Extracting date
+
+def func_uei(img):
+dateStr = ee.Date(img.get('"system":time_start')).format('YYYY-MM-dd')
+
+sample = img.addBands(lstLandsat) \ \
+.addBands(suhi) \ \
+.addBands(em) \ \
+.addBands(fv) \ \
+.sampleRegions(
+"collection"=trainingFeatures
+"properties"=['class']
+"scale"=30
+"geometries"=True
+)
+
+def func_njf(f):
+return f.set(**{
+    'date': dateStr
+}) \ \
+.map(func_njf)
+
+return sample
+
+samplesWithDate = withNdvi.map(func_uei
+
+'latitude': coords.get(1)
+)
+})
+geemap.ee_export_vector_to_drive(
+"collection"=sampleWithCoords.limit
+"description"='uhi_train_data_with_date'
+"folder"='GEE'
+"fileNamePrefix"='uhi_train_data_with_date'
+"fileFormat"='CSV'
+)
